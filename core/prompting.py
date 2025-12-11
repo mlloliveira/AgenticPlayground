@@ -22,7 +22,6 @@ def parse_thinking_keep_tags(text: str):
     return None, text
 
 def build_prompt_for_agent(agent: AgentConfig, branch: Branch, cfg: AppConfig, extra_preface: str = "") -> str:
-    show_time=False
     lines = []
     if extra_preface.strip():
         lines.append("[WEB RESULTS]"); lines.append(extra_preface.strip()); lines.append("")
@@ -31,11 +30,11 @@ def build_prompt_for_agent(agent: AgentConfig, branch: Branch, cfg: AppConfig, e
     lines.append("[CONVERSATION - most recent last]")
     for m in branch.messages:
         lines.append(f"{m.sender}: {m.content.strip()}")
-    if show_time:
+    if cfg.show_time:
         now = strftime("%Y-%m-%d", gmtime())
         lines.append("")
         lines.append("[CURRENT DAY]")
-        lines.append(f"Today is: {now}. Time format: YYYY-MM-DD. ")
+        lines.append(f"Today is: {now} (YYYY-MM-DD format). ")
     lines.append("")
     lines.append("[TASK]")
     lines.append(f"You are {agent.name}. Write your next message for the conversation above. "

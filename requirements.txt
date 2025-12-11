@@ -3,3 +3,5 @@ requests==2.31.0
 ddgs==9.7.1
 markdown==3.10
 cryptography==42.0.5
+pillow==11.1.0
+streamlit_code_editor

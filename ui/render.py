@@ -6,7 +6,9 @@ import hashlib
 import markdown as md
 from core.config import Msg, AppConfig, Branch
 from core.state import delete_from_here, _safe_rerun
+from core.vision import make_vit_patch_preview
 from ui.styles import FINAL_CARD_CSS
+
 
 __all__ = ["render_message", "bubble_html"]
 
@@ -134,6 +136,8 @@ def render_message(msg: Msg, idx: int, branch: Branch, cfg: AppConfig, editable:
     If `editable` is True, a tiny ✎ button appears on the right side; clicking it
     sets st.session_state["_editing"] = (branch.id, msg.id).
     """
+    if msg.role == "tool":
+        return
 
     def _render_context():
         if not (cfg.show_prompt_preview and msg.debug):
@@ -161,6 +165,7 @@ def render_message(msg: Msg, idx: int, branch: Branch, cfg: AppConfig, editable:
             if web_be:
                 st.caption(f"DDG backend: {web_be}")
 
+
             # Planner info (no duplicate source list; Sources panel already uses msg.sources)
             if dbg.get("planner_used"):
                 st.markdown("**Web Planner**")
@@ -168,6 +173,62 @@ def render_message(msg: Msg, idx: int, branch: Branch, cfg: AppConfig, editable:
                     "queries": dbg.get("web_queries", []),
                     "system_prompt": dbg.get("planner_system_prompt"),
                 })
+
+            # --- Tool usage details ---
+            tools_used = dbg.get("tools_used", [])
+            if tools_used:
+                st.markdown("**Tool Calls:**")
+                for t in tools_used:
+                    name = t.get("name")
+                    args = t.get("args")
+                    err = t.get("error")
+                    out = t.get("output")
+                    if err:
+                        st.markdown(f"- **{name}**({args}) – Error: {err}")
+                    else:
+                        st.markdown(f"- **{name}**({args}) – Result: {out}")
+                    # If this was a RAG search, show retrieval details
+                    if name == "rag_search" and not err:
+                        retrieved = t.get("retrieved", [])
+                        if retrieved:
+                            st.markdown("**Retrieved Chunks:**")
+                            for item in retrieved:
+                                text = item.get("text", "")
+                                score = item.get("score", 0.0)
+                                source = item.get("source", "")
+                                snippet = (text[:100] + "...") if len(text) > 100 else text
+                                st.markdown(f"> {snippet} *(score: {score:.2f}, source: {source})*")
+                        context_block = t.get("context", "")
+                        if context_block:
+                            st.markdown("**RAG Context Block:**")
+                            st.code(context_block, language="markdown")
+
+
+            # --- Vision / ViT-style patches (conceptual) ---
+            image_paths = dbg.get("image_paths") or []
+            if image_paths and cfg.vision.get("show_patch_grid", True):
+                st.markdown("**Vision (ViT-style patches — conceptual)**")
+                for idx, ipath in enumerate(image_paths, start=1):
+                    info = make_vit_patch_preview(ipath, cfg)
+                    if not info:
+                        continue
+                    preview_size = info["preview_size"]
+                    display_width = max(48, preview_size // 1)
+
+                    st.image(
+                        info["preview_path"],
+                        caption=(
+                            f"Downsized from {info['input_size'][0]}×{info['input_size'][1]} "
+                            f"to {info['preview_size']}×{info['preview_size']} with "
+                            f"{info['num_patches_per_side']*info['num_patches_per_side']} "
+                            f"patches ({info['patch_size']}×{info['patch_size']} each)."
+                        ),
+                        width=display_width,
+                    )
+
+                    st.caption(
+                        "This grid is a conceptual visualization of how vision transformers tokenize images, not a true representation of the vLLM model."
+                    )
 
             # --- Thinking trace (<think>…</think>) ---
             if getattr(cfg, "show_thinking", False) and getattr(msg, "thinking", None):

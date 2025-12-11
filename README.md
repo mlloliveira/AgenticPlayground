@@ -2,9 +2,9 @@
 
 An experimental, **transparent** and **modular** agentic LLM playground built on top of [Streamlit](https://streamlit.io) and [Ollama](https://ollama.com).
 
-The goal of this project is not to hide the magic, but to **expose how LLM agents think, plan and talk to each other.**. It is designed as a sandbox for experimenting with different agent setups, prompts and modes.
+The goal of this project is not to hide the magic, but to **expose how LLM agents think, plan and talk to each other.** It is designed as a sandbox for experimenting with different agent setups, prompts and modes.
 
-> ⚠️ This project is a work in progress. The core structure is ~70% there; features and modes will evolve over time.
+> ⚠️ This project is a work in progress. The core structure is ~80% there; features and modes will evolve over time.
 
 ---
 
@@ -14,6 +14,7 @@ The goal of this project is not to hide the magic, but to **expose how LLM agent
   - Show system prompts, full prepared prompts, tool usage, web searches and even *token-level* output.
   - Expose internal reasoning traces (e.g. `<think>...</think>`) for models that support reasoning.
   - Make it easy to inspect *why* an agent replied the way it did.
+  - For vision-capable models, show when and how images are sent, and provide a conceptual ViT-style view of image patching.
 
 - **Modular by design**  
   - Agents, modes and UI blocks are all defined in config and core modules.
@@ -22,7 +23,7 @@ The goal of this project is not to hide the magic, but to **expose how LLM agent
 
 - **Playground, not product**  
   - You are encouraged to fork, tweak agents, play with prompts, and create your own experimental setups.
-  - The UI is intentionally “power‑user friendly” rather than ultra-minimal.
+  - The UI is intentionally “power-user friendly” rather than ultra-minimal.
   - Streamlit provides the frontend so I can focus more on the backend.
 
 ---
@@ -32,7 +33,7 @@ The goal of this project is not to hide the magic, but to **expose how LLM agent
 ### Modes
 
 - **Chat**  
-  A standard chat with one or more agents, but with full visibility into system prompts, context and parameters.
+   A standard chat with one or more agents, but with full visibility into system prompts, context and parameters.
 
 - **Consul**  
   A “council of agents” mode where multiple agents debate / propose answers and a final response is formed.  
@@ -40,6 +41,13 @@ The goal of this project is not to hide the magic, but to **expose how LLM agent
   - voting / consensus,
   - diverse prompts per agent,
   - different models in the same run.
+
+- **Notebook**  
+  A mini, Streamlit-based notebook mode with:
+  - a Python code cell (REPL-style, with output),
+  - a markdown notepad,
+  - a safe execution sandbox.
+  - a basic multi-agent, multi-round chat around the notebook, so agents can discuss, plan and execute changes.
 
 > More modes (e.g. judge, storyteller/narrator, RAG) are planned but not yet implemented.
 
@@ -68,7 +76,41 @@ The goal of this project is not to hide the magic, but to **expose how LLM agent
   - Planner and summarizer agents run in the background to structure searches and maintain a running summary.
   - These are intentionally the only “special” agents; everything else should be composable by users.
 
-### Transparency tools
+### Vision / image input (vLLM support)
+
+
+- **Per-turn image control**
+  - Use the sidebar to attach an image to the next user message.
+  - The attached image is reused for later turns until you clear it.
+
+
+- **Model-agnostic & transparent**
+  - You can use any Ollama model; vision behavior depends on the model itself.
+  - Conceptual ViT-style patch view
+
+### Tools
+
+Tools are the main way agents interact with anything beyond pure text. Only works with "thinking" models.
+
+- **Calculator tool (`calc`)**
+  - Safe, structured calculator for numeric work.
+
+- **Dice / RNG tool (`dice`)**
+  - Roll virtual dice (e.g. for games, simulations, random choices).
+
+- **Read tool (`workspace_read`)**
+  - Lets agents read files such as snippets or notes.
+
+- **Write tool (`workspace_write`)**
+  - Let agents write/update files such snippets or notes.
+
+- **Notebook runner (`py_repl`)**
+  - Let agents executes the current notebook python files inside a restricted environment (no imports, limited builtins, step limit).
+
+- **Conversation search (`conv_search`)**
+  - Lets agents search within the current branch for earlier messages containing a query string.
+
+### Transparency 
 
 - **Context inspector**
   - For each agent message, you can open a **Context** panel that shows:
@@ -79,15 +121,25 @@ The goal of this project is not to hide the magic, but to **expose how LLM agent
     - Planner information (if used)
     - The thinking trace (for reasoning models)
     - The denorm output tokens
+    - Images passed to the model on that turn 
+
+- **Conceptual ViT-style patch view**
+  - When a message uses image input, the Context panel shows a `Vision (ViT-style patches — conceptual)` section.
+  - The image is downsampled (by default to 224×224) and overlaid with a 16×16 patch grid (14×14 ≈ 196 patches).
+  - This is an approximation of how ViT-like models tokenize images into patches / “image tokens”, meant to build intuition rather than reflect exact model internals.
 
 - **Thinking trace**
   - If enabled, and the model / backend supports it, the internal reasoning is captured as `msg.thinking`.
   - Shown in the Context panel as a **Thinking** section.
+  - When a reasoning model returns only thinking and no explicit answer, the playground prepends a warning to make this explicit.
+
+- **Tools**
+  - If a tool is used, it shows which tool and how it was used (tool name, arguments, and result).
 
 - **Denormalized output tokens**
   - When enabled, new assistant messages store the **denormalized** output tokens returned by Ollama’s `logprobs` API.
   - These are shown under Context as:
-    ```
+    ```text
     ‹I› ‹ hope› ‹ this› ‹ explanation› ‹ is› ‹ clear› ‹.›
     ```
   - Tokens are model-family agnostic and human-readable (spaces and newlines are preserved).
@@ -99,7 +151,7 @@ The goal of this project is not to hide the magic, but to **expose how LLM agent
   - A persistent mode bar at the top of the sidebar lets you switch between **Chat**, **Consul**, and **All Settings**.
   - **All Settings** is a dedicated page where you can:
     - Reorder sidebar sections (Models, Web, Presets, Global Params, Agents, UI & Tools, Consul, Save & Reset, Usage, …).
-    - Choose which sections are visible/hide in the normal sidebar.
+    - Choose which sections are visible/hidden in the normal sidebar.
     - Edit parameters even for sections that are hidden from the sidebar.
 
 - **Usage & reset tools**
@@ -120,6 +172,8 @@ The goal of this project is not to hide the magic, but to **expose how LLM agent
 - **[ddgs](https://pypi.org/project/ddgs/)** – DuckDuckGo search
 - **[markdown](https://pypi.org/project/Markdown/)** – Markdown rendering
 - **[cryptography](https://pypi.org/project/cryptography/)** – encrypted conversation saves (Fernet)
+- **[Pillow](https://pypi.org/project/pillow/)** – image loading and conceptual ViT-style grid previews for vision models
+- **[Streamlit code editor](https://github.com/bouzidanas/streamlit-code-editor)** – a code editor component for streamlit.io apps
 
 ---
 
@@ -159,6 +213,7 @@ requests==2.31.0
 ddgs==9.7.1
 markdown==3.10
 cryptography==42.0.5
+streamlit_code_editor
 ```
 
 You can pin versions using the provided `version.py` helper (see below).
@@ -189,18 +244,22 @@ The repository is roughly organized as:
 app.py                  # Streamlit entry point
 
 core/
-  config.py             # AppConfig, AgentConfig, Branch, Msg, presets
-  state.py              # Global state, sidebar, All Settings, branches, usage
-  ollama_client.py      # Thin HTTP client for Ollama (generate, ps, unload)
   agents.py             # Default agent definitions (Chat & Consul)
-  web_tools.py          # DuckDuckGo search + summarization helpers
-  runtime_web.py        # Web planner / summarizer logic
-  prompting.py          # Prompt construction & <think> parsing
+  config.py             # AppConfig, AgentConfig, Branch, Msg, presets
   conversations.py      # Save/load encrypted conversation branches
+  ollama_client.py      # Thin HTTP client for Ollama (generate, ps, unload)
+  prompting.py          # Prompt construction & <think> parsing
+  runtime_web.py        # Web planner / summarizer logic
+  state.py              # Global state, sidebar, All Settings, branches, usage
+  tools.py              # Tools such as math, dice, read and write.          
+  vision.py             # Vision/vLLM helpers
+  web_tools.py          # DuckDuckGo search + summarization helpers
 
 views/
   chat.py               # Chat mode page
   consul.py             # Consul mode page
+  notebook.py           # Notebook mode page
+  notebook_imports.py   # Helpers for the notebook mode
   runtime.py            # Shared runtime helpers (run_agents_for_turn, etc.)
   settings.py           # All Settings page (sidebar layout, etc.)
 
@@ -209,13 +268,6 @@ ui/
   render.py             # Rendering of messages, bubbles, context, tokens
 ```
 
-You can customize agents, prompts and behavior primarily via:
-
-- `core/config.py` (agent definitions & parameters)
-- `core/agents.py`
-- `core/prompting.py`
-- `core/state.py` (sidebar & layout)
-- `app/views/*` (mode-specific UI)
 
 ---
 
@@ -223,6 +275,8 @@ You can customize agents, prompts and behavior primarily via:
 
 Some directions this playground is planned (or suitable) for:
 
+- **More tools**
+  - File-scoped tools, plotting tools, simple database / vector store tools.
 - **Judge modes**
   - Independent judge agent that scores or critiques answers from other agents.
 - **Storytelling / narrator mode**

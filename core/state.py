@@ -2,29 +2,28 @@
 import os, uuid, requests, json, copy, subprocess, re
 import streamlit as st
 from time import gmtime, strftime
+from cryptography.fernet import InvalidToken
 from pathlib import Path
 from typing  import Dict, List, Optional
-from .config import AppConfig, AgentConfig, GenParams, Branch, Msg
-from .config import Preset, preset_to_dict, preset_from_dict, DEFAULT_CHAT_AGENTS, DEFAULT_CONSUL_AGENTS
-from .conversations import list_saved_conversations, save_current_branch, load_conversation_payload, delete_conversation
-from core.ollama_client import list_running_models, unload_model
+from .conversations import list_saved_conversations, save_current_branch, load_conversation_payload, delete_conversation, get_fernet  
+from .ollama_client import list_running_models, unload_model
+from .config import(AppConfig, AgentConfig, GenParams, Branch, Msg,
+                      Preset, preset_to_dict, preset_from_dict, DEFAULT_CHAT_AGENTS, DEFAULT_CONSUL_AGENTS, DEFAULT_NOTEBOOK_AGENTS,
+                      DEFAULT_SIDEBAR_LAYOUT, DEFAULT_SIDEBAR_EXPANDED,
+)
+from .vision import purge_uploads_dir
+
 
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 
-#PRESET_DIR = os.path.join(os.getcwd(), "presets")
-#os.makedirs(PRESET_DIR, exist_ok=True)
-# PRESETS_DIR = os.path.join("app", "presets")  # consistent with your tree
-# os.makedirs(PRESETS_DIR, exist_ok=True)
 PROJECT_APP_DIR = Path(__file__).resolve().parents[1]
 PRESETS_DIR = PROJECT_APP_DIR / "presets"
 os.makedirs(PRESETS_DIR, exist_ok=True)
 
+UPLOADS_DIR = PROJECT_APP_DIR / "uploads"
+os.makedirs(UPLOADS_DIR, exist_ok=True)
 
-# DEFAULT_AGENTS = [
-#     AgentConfig(name="Agent A", system_prompt="You are Agent A, a pragmatic strategist. Be concise and practical.", is_summarizer=False),
-#     AgentConfig(name="Agent B", system_prompt="You are Agent B, a critical analyst. Challenge assumptions respectfully.", is_summarizer=False),
-#     AgentConfig(name="Summarizer", system_prompt="You are a neutral summarizer. Only summarize; do not add any opinions.", is_summarizer=True),
-# ]
+
 
 SIDEBAR_BLOCK_LABELS = { # Sidebar blocks (configurable order & visibility) 
     "MODELS": "Models",
@@ -39,6 +38,69 @@ SIDEBAR_BLOCK_LABELS = { # Sidebar blocks (configurable order & visibility)
 }
 
 ALL_SIDEBAR_BLOCKS = list(SIDEBAR_BLOCK_LABELS.keys())
+
+def _parse_advanced_option_value(name: str, raw: str):
+    """
+    Best-effort parsing of advanced option values from the UI.
+
+    - For `think`, we handle:
+        - booleans: true/false
+        - levels: low/medium/high  (kept as lowercase strings)
+    - For others:
+        - "true"/"false" → bool
+        - ints / floats → numbers
+        - JSON-looking strings ([...] or {...}) → json.loads
+        - everything else → raw string
+    """
+    s = raw.strip()
+    if not s:
+        return s
+
+    # Special handling for `think`
+    if name == "think":
+        low = s.lower()
+        if low in ("true", "t", "1", "yes", "on"):
+            return True
+        if low in ("false", "f", "0", "no", "off"):
+            return False
+        if low in ("low", "medium", "high"):
+            # For GPT-OSS / other models that expect "low"/"medium"/"high"
+            return low
+        # Fallback: send whatever the user typed
+        return s
+
+    # Common bools
+    low = s.lower()
+    if low == "true":
+        return True
+    if low == "false":
+        return False
+
+    # Int?
+    try:
+        if re.fullmatch(r"-?\d+", s):
+            return int(s)
+    except Exception:
+        pass
+
+    # Float?
+    try:
+        if re.fullmatch(r"-?\d+\.\d*", s):
+            return float(s)
+    except Exception:
+        pass
+
+    # JSON array/object? (useful for stop lists)
+    if s.startswith("[") or s.startswith("{"):
+        try:
+            return json.loads(s)
+        except Exception:
+            # If it looks like JSON but fails, just pass it as a string
+            return s
+
+    # Default: string
+    return s
+
 
 
 def _sort_agents_for_display(agents):
@@ -210,6 +272,49 @@ def reset_active_branch_for_current_mode() -> None:
     st.session_state.active_branch_id = main_id
     # Note: usage totals are NOT reset here on purpose.
 
+def reset_notebook_files(cfg: AppConfig) -> None: #For the Notebook mode
+    """
+    Delete the three Notebook files (notes/setup/agent) in workspace/
+    and clear notebook-related session_state so the next visit to
+    Notebook mode recreates them with default content.
+
+    Actual default contents live in views/notebook.py; we just remove
+    the files and in-memory state here.
+    """
+    # Workspace dir from config (same as views/notebook.py)
+    workspace_dir = getattr(cfg, "workspace_dir", "workspace") or "workspace"
+    os.makedirs(workspace_dir, exist_ok=True)
+
+    nb = cfg.notebook
+
+    notes_filename = nb.get("notes_filename", "notebook_notes.md")
+    setup_filename = nb.get("setup_filename", "notebook_setup.py")
+    agent_filename = nb.get("agent_filename", "notebook_agent.py")
+
+    filenames = [notes_filename, setup_filename, agent_filename]
+
+    # Delete files if present
+    for fname in filenames:
+        path = os.path.join(workspace_dir, fname)
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            st.warning(f"Could not delete notebook file {fname}: {e}")
+
+    # Clear notebook-related session_state so editors re-init on next render
+    for key in [
+        "dual_ns",
+        "setup_code", "setup_synced", "setup_mtime",
+        "setup_stdout", "setup_stderr", "setup_exception",
+        "agent_code", "agent_synced", "agent_mtime",
+        "agent_stdout", "agent_stderr", "agent_exception",
+        "notebook_md_code", "notebook_md_synced",
+        "notebook_md_mtime", "notebook_md_last_run",
+    ]:
+        st.session_state.pop(key, None)
+
 def is_planner(agent) -> bool:
     try:
         if getattr(agent, "is_summarizer", False):
@@ -235,14 +340,10 @@ def ensure_planner_agent(cfg):
         "web-searchable queries. Do not answer the questions or the queries yourself. Prepare the "
         "queries to be loaded into a web search engine. You can give an empty array if believe it is "
         "not a searchable question.  Do not use punctuation. Output STRICT JSON only: {\"queries\": [\"...\", \"...\"]}"),
-        # system_prompt=("You are a web-query planner. Given a user prompt, produce 1–5 specific, "
-        #                "web-searchable queries. Do not answer the questions or the queries yourself. "
-        #                "Prepare the queries to be loaded into a web search engine. Do not use punctuation. "
-        #                "Output STRICT JSON only: {\"queries\": [\"...\", \"...\"]}"),
         model=cfg.global_model,
         enabled=True,                           # default ON
         params_override={"_role": "planner"},   # marker
-        think_api=False,
+        #think_api=False,
         allow_web=False,                        # planner itself does not fetch
         is_summarizer=False,
     )
@@ -299,9 +400,14 @@ def ensure_state():
             pass
 
     cfg = st.session_state.app_config
-    # Prime the widget state once from the config, if not already set | Avoids warning
-    if "same_model_for_all" not in st.session_state:
-        st.session_state["same_model_for_all"] = cfg.same_model_for_all
+    # # Prime the widget state once from the config, if not already set | Avoids warning
+    # if "same_model_for_all" not in st.session_state:
+    #     st.session_state["same_model_for_all"] = cfg.same_model_for_all
+
+    # Purge uploads once per browser session
+    if "_uploads_purged" not in st.session_state:
+        purge_uploads_dir()
+        st.session_state["_uploads_purged"] = True
 
     # Always guarantee we have a Web Planner and keep agent order stable
     ensure_planner_agent(cfg)
@@ -312,6 +418,7 @@ def ensure_state():
         branches: Dict[str, Branch] = {}
         branches["main-chat"] = Branch(id="main-chat", label="main-chat")
         branches["main-consul"] = Branch(id="main-consul", label="main-consul")
+        branches["main-notebook"] = Branch(id="main-notebook", label="main-notebook")
         st.session_state.branches = branches
         st.session_state.active_branch_id = "main-chat"
         st.session_state.root_branch_id = "main-chat"  # legacy pointer (can be deleted later)
@@ -322,6 +429,8 @@ def ensure_state():
             br["main-chat"] = Branch(id="main-chat", label="main-chat")
         if "main-consul" not in br:
             br["main-consul"] = Branch(id="main-consul", label="main-consul")
+        if "main-notebook" not in br:
+            br["main-notebook"] = Branch(id="main-notebook", label="main-notebook")
 
     # --- Models cache ---
     if "models_cache" not in st.session_state:
@@ -354,45 +463,90 @@ def ensure_mode(mode: str, cfg):
     Rebuild the agent list whenever the user switches mode.
     We always keep utility agents (summarizer + web planner),
     and then append the mode-specific default agents.
+    Invariants:
+    - At most ONE summarizer agent (is_summarizer=True).
+    - At most ONE planner (is_planner(agent) == True).
+    - Summarizer & planner are treated as utilities and preserved across modes.
+    - Mode-specific agents (Chat / Consul) are rebuilt from defaults.
     """
     import copy
 
-    # detect mode change
+    # --- Detect mode change ---
     last_mode = st.session_state.get("_active_mode")
     if last_mode == mode:
         # same mode as last time → do nothing
         return
-
     st.session_state["_active_mode"] = mode
 
-    # keep current utility agents (summarizer + planner) if they exist
-    utils = [copy.deepcopy(a) for a in cfg.agents
-             if getattr(a, "is_summarizer", False) or is_planner(a)]
+    # --- 1) Keep / create utility agents (summarizer + planner) ---
 
-    # load mode-specific defaults
+    # Reuse the first existing summarizer if present
+    summarizer = next(
+        (a for a in cfg.agents if getattr(a, "is_summarizer", False)),
+        None,
+    )
+
+    # If we don't have one yet, bootstrap from the default Chat agents
+    if summarizer is None:
+        # Find a template summarizer in DEFAULT_CHAT_AGENTS (your single source of truth)
+        template = next(
+            (a for a in DEFAULT_CHAT_AGENTS if getattr(a, "is_summarizer", False)),
+            None,
+        )
+        if template is not None:
+            # deepcopy once → new AgentConfig with its own uid
+            summarizer = copy.deepcopy(template)
+
+    # Reuse the first existing planner if present (don't deepcopy so uid & edits persist)
+    planner = next((a for a in cfg.agents if is_planner(a)), None)
+
+    # --- 2) Build mode-specific agents from defaults (excluding utilities) ---
+
     if mode == "chat":
-        base = copy.deepcopy(DEFAULT_CHAT_AGENTS)
+        base_template = DEFAULT_CHAT_AGENTS
     elif mode == "consul":
-        base = copy.deepcopy(DEFAULT_CONSUL_AGENTS)
+        base_template = DEFAULT_CONSUL_AGENTS
+    elif mode == "notebook":
+        base_template = DEFAULT_NOTEBOOK_AGENTS
     else:
-        base = []
+        base_template = []
 
-    # rebuild roster: utilities first, then mode agents
-    cfg.agents = utils + base
+    mode_agents = []
+    for a in base_template:
+        # Skip summarizers & planners here; we manage them as utilities above
+        if getattr(a, "is_summarizer", False) or is_planner(a):
+            continue
+        mode_agents.append(copy.deepcopy(a))
 
-    # make sure a planner exists and sits under the summarizer
-    ensure_planner_agent(cfg)
+    # --- 3) Assemble the new roster: summarizer, planner, then mode agents ---
+
+    new_agents: List[AgentConfig] = []
+
+    if summarizer is not None:
+        new_agents.append(summarizer)
+
+    if planner is not None:
+        new_agents.append(planner)
+
+    new_agents.extend(mode_agents)
+
+    cfg.agents = new_agents
+
+    # --- 4) Guarantee a planner exists & sits under the summarizer ---
+
+    ensure_planner_agent(cfg)  # no-op if a planner is already present
 
     # Keep planner “enabled” in lockstep with Internet toggle
+    web_on = bool(cfg.web_tool.get("enabled", False))
     for a in cfg.agents:
         if is_planner(a):
-            a.enabled = bool(cfg.web_tool.get("enabled", False))
+            a.enabled = web_on
 
-     # When entering a mode, auto-switch to that mode's main branch
+    # --- 5) Bind branches to mode & keep agent order stable ---
+
     if not _branch_belongs_to_mode(st.session_state.active_branch_id, mode):
         st.session_state.active_branch_id = f"main-{mode}"
 
-    # keep visual order stable: normal agents first, then silent ones
     cfg.agents = _sort_agents_for_display(cfg.agents)
     st.rerun()
 
@@ -470,8 +624,10 @@ def get_active_branch() -> Branch:
 def switch_active_branch(branch_id: str):
     st.session_state.active_branch_id = branch_id
 
-def add_user_message(text: str):
-    get_active_branch().messages.append(Msg(role="user", sender="User", content=text))
+def add_user_message(text: str, images: Optional[List[str]] = None):
+    get_active_branch().messages.append(
+        Msg(role="user", sender="User", content=text, images=images or [])
+    )
 
 def delete_from_here(branch_id: str, msg_id: str):
     branch = st.session_state.branches[branch_id]
@@ -522,20 +678,22 @@ def fork_from_edit(branch_id: str, msg_id: str, new_text: str) -> Optional[str]:
             content=new_text.strip(),
             markdown=getattr(old, "markdown", False),
             thinking=getattr(old, "thinking", None),
+            images=getattr(old, "images", []),
         )
         new_branch.messages.append(edited)
         # (no later messages — they'll be regenerated on this branch)
     else:
-        # copy all messages, but replace this one in-place
-        new_branch.messages = list(src.messages)
-        edited = Msg(
+        # copy all messages,
+        new_branch.messages = src.messages.copy()
+        # replace only this one
+        new_branch.messages[idx] = Msg(
             role=old.role,
             sender=old.sender,
             content=new_text.strip(),
             markdown=getattr(old, "markdown", False),
             thinking=getattr(old, "thinking", None),
+            images=getattr(old, "images", []),
         )
-        new_branch.messages[idx] = edited
 
     brs[new_id] = new_branch
     st.session_state.active_branch_id = new_id
@@ -545,18 +703,7 @@ def fork_from_edit(branch_id: str, msg_id: str, new_text: str) -> Optional[str]:
 
 
 # --- Sidebar blocks ---
-SIDEBAR_EXPANDED_DEFAULTS = { # Default "expanded" state for each sidebar block
-    "MODELS": True,
-    "WEB": False,
-    "PRESETS": False,
-    "GLOBAL_PARAMS": False,
-    "AGENTS": True,
-    "UI": False,
-    "CONSUL": False,
-    "SAVE_RESET": False,
-    "USAGE": True,  
-}
-
+SIDEBAR_EXPANDED_DEFAULTS = DEFAULT_SIDEBAR_EXPANDED # Default from core.config
 
 def sidebar_block_models(cfg: AppConfig):
     with st.expander("Models", expanded=_sidebar_expanded_for(cfg, "MODELS", default=SIDEBAR_EXPANDED_DEFAULTS["MODELS"])):
@@ -564,21 +711,31 @@ def sidebar_block_models(cfg: AppConfig):
         with colA:
             cfg.same_model_for_all = st.checkbox(
                 "Use same model for all agents",
-                key="same_model_for_all",
                 help="When enabled, all agents share the same base model.",
-                #value=True, #Streamlit will use st.session_state["same_model_for_all"]
+                value=cfg.same_model_for_all,
             )
         with colB:
-            if st.button("↺ Refresh models", key="refresh_models",
+            if st.button("↺ Refresh", key="refresh_models",
                          help="Query Ollama for the latest list of available models from Ollama."):
                 st.session_state.models_cache = list_ollama_models()
 
-        models = st.session_state.get("models_cache", []) or ["llama3:8b"]
+        # Verify if the global model is in the model cache of Ollama
+        models = st.session_state.get("models_cache", []) 
+        if not models: # No models detected from Ollama
+            st.warning("No Ollama models found. Use `ollama pull <model>` in your terminal to install a model, then click “Refresh models”.")
+            models = [cfg.global_model]
+            model_idx = 0
+        else:
+            if cfg.global_model in models: #Checks if model belongs to the list of models
+                model_idx = models.index(cfg.global_model)
+            else:
+                model_idx = 0
+                cfg.global_model = models[0]
 
         cfg.global_model = st.selectbox(
             "Global model",
             options=models,
-            key="global_model_select",
+            index=model_idx,
             help="Base model used when 'Use same model for all agents' is ON.",
         )
 
@@ -610,7 +767,6 @@ def sidebar_block_web(cfg: AppConfig):
         cfg.web_tool["enabled"] = st.checkbox(
             "Enable internet (applies to all agents)",
             value=bool(cfg.web_tool.get("enabled", False)),
-            key="enable_web_tool",
             help="When ON, the Web Planner auto-generates queries (or start your prompt with `#web:` for manual queries).",
         )
         if cfg.web_tool["enabled"]:
@@ -618,14 +774,12 @@ def sidebar_block_web(cfg: AppConfig):
                 "Web: results per query",
                 1, 10, int(cfg.web_tool.get("ddg_results", 5)),
                 1,
-                key="ddg_results",
                 help="Number of web search hits per query to feed into the agents.",
             )
             cfg.web_tool["max_chars"] = st.number_input(
                 "Web: summary max chars",
                 value=int(cfg.web_tool.get("max_chars", 8000)),
                 min_value=500,
-                key="web_max_chars",
                 help="Maximum characters in the web brief passed in front of the agents.",
             )
 
@@ -686,32 +840,111 @@ def sidebar_block_global_params(cfg: AppConfig):
         a, b = st.columns(2)
         with a:
             gp.temperature = st.slider(
-                "Temperature", 0.0, 2.0, gp.temperature, 0.05, key="g_temp",
+                "Temperature", 0.0, 2.0, float(gp.temperature), 0.05,
                 help="Higher = more random; lower = more deterministic.",
             )
             gp.top_k = st.number_input(
-                "top_k", 0, 2048, int(gp.top_k), 10, key="g_topk",
+                "top_k", 0, 2048, int(gp.top_k), 10, 
                 help="Limit sampling to the top-K tokens (0 = disabled).",
             )
             gp.num_ctx = st.number_input(
-                "Context window (num_ctx)", 256, 131072, int(gp.num_ctx), 256, key="g_numctx",
+                "Context window (num_ctx)", 256, 131072, int(gp.num_ctx), 256,
                 help="Maximum tokens of context to keep in the window.",
             )
         with b:
             gp.top_p = st.slider(
-                "top_p", 0.0, 1.0, gp.top_p, 0.01, key="g_topp",
+                "top_p", 0.0, 1.0, float(gp.top_p), 0.01,
                 help="Nucleus sampling: consider tokens whose cumulative probability ≤ top_p.",
             )
             gp.max_tokens = st.number_input(
-                "Max tokens (response)", 16, 32768, int(gp.max_tokens), 16, key="g_maxtok",
+                "Max tokens (response)", 16, 32768, int(gp.max_tokens), 16,
                 help="Maximum length of a single response.",
             )
-            gp.seed = st.text_input(
+            seed_str = st.text_input(
                 "Seed (optional)",
-                value="" if gp.seed is None else str(gp.seed),
-                key="g_seed",
+                value="" if gp.seed in (None, "", "None") else str(gp.seed),
                 help="Fix this to make generations reproducible. Leave empty for random.",
             )
+            gp.seed = seed_str or None
+        # --- Advanced options (min_p, stop, repeat_penalty, think, raw, etc.) ---
+        with st.expander("Advanced options", expanded=False):
+            # A curated list of Ollama options we don't expose directly.
+            # Users can still type any key they want, but this list makes discovery easier
+            ADV_KEYS = [
+                "min_p",
+                "stop",
+                "repeat_penalty",
+                "repeat_last_n",
+                "mirostat",
+                "mirostat_tau",
+                "mirostat_eta",
+                "tfs_z",
+                "raw",
+                "think",
+                "presence_penalty",
+                "frequency_penalty",
+            ]
+
+            col1, col2, col3 = st.columns([0.4, 0.4, 0.2])
+            with col1:
+                adv_key = st.selectbox(
+                    "Parameter",
+                    options=ADV_KEYS,
+                    key="adv_opt_key",
+                    help="Advanced Ollama option to set. These are added to the `options` dict.",
+                )
+            with col2:
+                adv_val_raw = st.text_input(
+                    "Value",
+                    key="adv_opt_value",
+                    placeholder='e.g. 0.05, true, ["\\nUser:", "</s>"], low',
+                    help="Free-form value. Parsed as bool/number/JSON when possible; otherwise sent as a string. "
+                         "It might give errors if done poorly."
+                )
+            with col3:
+                if st.button(
+                    "Set",
+                    key="adv_opt_add",
+                    help="Add or update this advanced option.",
+                ):
+                    val_str = adv_val_raw.strip()
+                    if val_str:
+                        parsed = _parse_advanced_option_value(adv_key, val_str)
+                        if gp.extra_options is None:
+                            gp.extra_options = {}
+                        gp.extra_options[adv_key] = parsed
+                        #_safe_rerun()
+
+            # Show current advanced options with per-key delete buttons
+            if gp.extra_options:
+                st.markdown("**Current advanced options**")
+                to_delete = []
+                for k in sorted(gp.extra_options.keys()):
+                    v = gp.extra_options[k]
+                    colL, colR = st.columns([0.85, 0.15])
+                    with colL:
+                        # read-only display of the option and its value
+                        st.text_input(
+                            k,
+                            value=repr(v),
+                            key=f"adv_show_{k}",
+                            disabled=True,
+                        )
+                    with colR:
+                        if st.button(
+                            "🗑",
+                            key=f"adv_del_{k}",
+                            help=f"Remove advanced option '{k}'.",
+                        ):
+                            to_delete.append(k)
+                if to_delete:
+                    for k in to_delete:
+                        gp.extra_options.pop(k, None)
+                    _safe_rerun()
+            else:
+                st.caption("No advanced options set. Use the controls above to add one.")
+
+        # Finally, clamp and save back to config (extra_options is preserved in clamped()).
         cfg.global_params = gp.clamped()
 
 def sidebar_block_agents(cfg: AppConfig):
@@ -793,17 +1026,10 @@ def sidebar_block_agents(cfg: AppConfig):
                     help="Instructions / persona for this agent.",
                 )
 
-                cols = st.columns(2) #(3)
-                # with cols[0]:
-                #     agent.think_api = st.checkbox(
-                #         "Thinking API",
-                #         value=agent.think_api,
-                #         key=f"think_{agent.uid}",
-                #         help="When supported by the model, capture hidden 'thinking' traces.",
-                #     )
-                with cols[0]: #[1]
+                cols = st.columns(2) 
+                with cols[0]:
                     pass
-                with cols[1]: #[2]
+                with cols[1]: 
                     if not agent.is_summarizer:
                         if not getattr(agent, "is_planner", False):
                             if st.button(
@@ -818,7 +1044,7 @@ def sidebar_block_agents(cfg: AppConfig):
                             st.caption("Planner can be disabled via the Internet toggle, not removed.")
 
 def sidebar_block_ui(cfg: AppConfig):
-    with st.expander("UI Tools", expanded=_sidebar_expanded_for(cfg, "UI", default=SIDEBAR_EXPANDED_DEFAULTS["UI"])):
+    with st.expander("UI & Tools", expanded=_sidebar_expanded_for(cfg, "UI", default=SIDEBAR_EXPANDED_DEFAULTS["UI"])):
         cfg.blind_first_turn = st.checkbox(
             "Blind first turn",
             value=cfg.blind_first_turn,
@@ -830,6 +1056,12 @@ def sidebar_block_ui(cfg: AppConfig):
             value=bool(getattr(cfg, "markdown_all", False)),
             key="markdown_all_toggle",
             help="When ON, all messages render as Markdown cards.",
+        )
+        cfg.show_time = st.checkbox(
+            "Show date",
+            value=cfg.show_time,
+            key="show_time",
+            help="When ON, agents can see the current date.",
         )
         cfg.show_thinking = st.checkbox(
             "Show the thinking for models that support reasoning",
@@ -854,26 +1086,237 @@ def sidebar_block_ui(cfg: AppConfig):
         if not supports_logprobs:
             st.caption("Requires Ollama ≥ 0.12.11 (logprobs support).")
 
+        cfg.feature_flags["ollama_tools"] = st.checkbox(
+            "Use Ollama tools (function calling)",
+            value=cfg.feature_flags.get("ollama_tools", False),
+            key="ollama_tools",
+            help=(
+                "Use Ollama's native tool calling via /api/chat. "
+                "Some models (for example deepseek-r1:14b or gemma3:12b) "
+                "do NOT support tools and will error when this is enabled."
+            ),
+        )
+
+         
+        # --- Tools configuration ---
+        with st.expander("Tools", expanded=False):
+             st.markdown("**Tools availability:**")
+             st.markdown("1- Chat &nbsp; &nbsp; &nbsp;2- Consul &nbsp; &nbsp; &nbsp;3- Notebook")
+             for tool_name, tool_cfg in cfg.tools.items():
+                 display_name = (getattr(tool_cfg, "label", "") or tool_name.replace("_", " ").title())
+                 description_info = (getattr(tool_cfg, "description", ""))
+                 cols = st.columns([0.4, 0.2, 0.2, 0.2])
+                 with cols[0]:
+                     st.markdown(display_name, help=description_info)
+                 with cols[1]:
+                     current_chat = tool_cfg.enabled_modes.get("chat", False)
+                     tool_cfg.enabled_modes["chat"] = st.checkbox(
+                         "1", value=current_chat, key=f"tool_{tool_name}_chat",
+                         help=f"Allow '{tool_name}' in Chat mode.",
+                     )
+                 with cols[2]:
+                     current_consul = tool_cfg.enabled_modes.get("consul", False)
+                     tool_cfg.enabled_modes["consul"] = st.checkbox(
+                         "2", value=current_consul, key=f"tool_{tool_name}_consul",
+                         help=f"Allow '{tool_name}' in Consul mode.",
+                     )
+                 with cols[3]:
+                     current_consul = tool_cfg.enabled_modes.get("notebook", False)
+                     tool_cfg.enabled_modes["notebook"] = st.checkbox(
+                         "3", value=current_consul, key=f"tool_{tool_name}_notebook",
+                         help=f"Allow '{tool_name}' in Notebook mode.",
+                     )
+                 # If the tool has specific settings, provide appropriate input widgets
+                 if tool_name == "rag_search":
+                     # RAG tool: select index and number of results
+                     index_opts = list(cfg.rag_indexes.keys())
+                     default_idx = tool_cfg.settings.get("index") or (index_opts[0] if index_opts else "")
+                     if index_opts:
+                         chosen_idx = st.selectbox("RAG Index", options=index_opts, index=index_opts.index(default_idx) if default_idx in index_opts else 0,
+                                                   key=f"rag_index_select")
+                         tool_cfg.settings["index"] = chosen_idx
+                     else:
+                         st.text("(No RAG indexes configured)")
+                     top_k = int(tool_cfg.settings.get("top_k", 3))
+                     tool_cfg.settings["top_k"] = st.number_input("Top-K results", min_value=1, max_value=10, value=top_k, key=f"rag_topk_setting")
+                 elif tool_cfg.settings:
+                    # Generic settings handling for other tools
+                    for setting_name, setting_val in tool_cfg.settings.items():
+                        setting_key = f"tool_{tool_name}_{setting_name}"
+
+                        # Simple scalar types: editable
+                        if isinstance(setting_val, bool):
+                            tool_cfg.settings[setting_name] = st.checkbox(
+                                f"{tool_name}: {setting_name}",
+                                value=setting_val,
+                                key=setting_key,
+                            )
+                        elif isinstance(setting_val, (int, float)):
+                            tool_cfg.settings[setting_name] = st.number_input(
+                                f"{tool_name}: {setting_name}",
+                                value=setting_val,
+                                key=setting_key,
+                            )
+
+                        # Structured settings (dict/list): show read-only JSON for transparency, but don't overwrite.
+                        elif isinstance(setting_val, (dict, list)):
+                            st.text_area(
+                                f"{tool_name}: {setting_name} (read-only JSON)",
+                                value=json.dumps(setting_val, indent=2),
+                                key=setting_key,
+                                height=120,
+                                disabled=True,
+                            )
+
+                        # Fallback: editable text
+                        else:
+                            tool_cfg.settings[setting_name] = st.text_input(
+                                f"{tool_name}: {setting_name}",
+                                value=str(setting_val),
+                                key=setting_key,
+                            )
+
+        # --- Image uploads (for vision models) ---
+        with st.expander("Upload images", expanded=False):
+            mode = st.session_state.get("mode", "chat")
+            pending_images_key = f"_{mode}_pending_images"
+            pending_images = st.session_state.get(pending_images_key, [])
+            #
+            uploaded_files = st.file_uploader(
+                "Choose image(s) to attach to the next message",
+                type=["png", "jpg", "jpeg", "webp"],
+                key=f"image_uploader_{mode}",
+                accept_multiple_files=True,
+            )
+
+            if uploaded_files:
+                try:
+                    UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+
+                    # avoid duplicates if user reselects the same files
+                    existing_paths = {img["path"] for img in pending_images}
+
+                    for uf in uploaded_files:
+                        dest = UPLOADS_DIR / uf.name
+                        with open(dest, "wb") as f:
+                            f.write(uf.getbuffer())
+                        path_str = str(dest)
+                        if path_str not in existing_paths:
+                            pending_images.append({"path": path_str, "name": uf.name})
+                            existing_paths.add(path_str)
+
+                    st.session_state[pending_images_key] = pending_images
+                    st.success(f"Attached {len(uploaded_files)} image(s) to the next {mode} message.")
+                except Exception as e:
+                    st.warning(f"Could not save uploaded image(s): {e}")
+
+            # Show what is currently pending
+            if pending_images:
+                names = ", ".join(img["name"] for img in pending_images)
+                st.caption(f"Pending images for next {mode} message: {names}")
+                if st.button("Clear pending images", key=f"clear_imgs_{mode}"):
+                    st.session_state[pending_images_key] = []
+
+
 def sidebar_block_consul(cfg: AppConfig):
-    with st.expander("Consul defaults", expanded=_sidebar_expanded_for(cfg, "CONSUL", default=SIDEBAR_EXPANDED_DEFAULTS["CONSUL"])):
-        cfg.consul["rounds"] = st.number_input(
-            "Rounds",
-            1, 10, int(cfg.consul.get("rounds", 3)),
-            key="consul_rounds",
-            help="How many debate rounds the Consul should run before voting.",
-        )
-        voting_opts = ["majority", "confidence", "judge"]
-        cur_v = cfg.consul.get("voting", "majority")
-        if cur_v not in voting_opts:
-            cur_v = "majority"
-        cfg.consul["voting"] = st.selectbox(
-            "Voting",
-            voting_opts,
-            index=voting_opts.index(cur_v),
-            key="consul_voting",
-            help="How the council chooses a single Final Answer.",
-        )
-        # You can re-enable alpha / auto_web_brief as needed here later.
+    with st.expander("Mode Parameters", expanded=_sidebar_expanded_for(cfg, "CONSUL", default=SIDEBAR_EXPANDED_DEFAULTS["CONSUL"])):
+        # --- Consul parameters ---
+        with st.expander("Consul", expanded=False):
+            cfg.consul["rounds"] = st.number_input(
+                "Rounds",
+                1, 10, int(cfg.consul.get("rounds", 3)),
+                key="consul_rounds",
+                help="How many debate rounds the Consul should run before voting.",
+            )
+            voting_opts = ["majority", "confidence", "judge"]
+            cur_v = cfg.consul.get("voting", "majority")
+            if cur_v not in voting_opts:
+                cur_v = "majority"
+            cfg.consul["voting"] = st.selectbox(
+                "Voting",
+                voting_opts,
+                index=voting_opts.index(cur_v),
+                key="consul_voting",
+                help="How the council chooses a single Final Answer.",
+            ) # You can re-enable alpha / auto_web_brief as needed here later.
+        # --- Notebook parameters ---
+        with st.expander("Notebook", expanded=False):
+            nb = cfg.notebook
+
+            nb["autosave"] = st.checkbox(
+                "Autosave notebook files to workspace/",
+                value=bool(nb.get("autosave", True)),
+                key="notebook_autosave",
+                help="When enabled, every Run writes the notebook cells to files under the workspace directory.",
+            )
+
+            nb["rounds"] = st.number_input(
+                "Notebook rounds",
+                min_value=1,
+                max_value=20,
+                step=1,
+                value=int(nb.get("rounds", 3)),
+                help="How many collaborative rounds the Notebook agents run after each user message.",
+                key="notebook_rounds",
+            )
+
+            nb["max_output_chars"] = st.number_input(
+                "Max output characters (agent + setup)",
+                min_value=1_000,
+                max_value=200_000,
+                step=1_000,
+                value=int(nb.get("max_output_chars", 20_000)),
+                key="notebook_max_output_chars",
+            )
+
+            st.caption("Filenames (relative to workspace/) used by the Notebook mode:")
+
+            col_notes, col_setup, col_agent = st.columns(3)
+
+            with col_notes:
+                nb["notes_filename"] = st.text_input(
+                    "Notes file",
+                    value=nb.get("notes_filename", "notebook_notes.md"),
+                    key="notebook_notes_filename",
+                )
+
+            with col_setup:
+                nb["setup_filename"] = st.text_input(
+                    "Setup file",
+                    value=nb.get("setup_filename", "notebook_setup.py"),
+                    key="notebook_setup_filename",
+                )
+
+            with col_agent:
+                nb["agent_filename"] = st.text_input(
+                    "Agent file",
+                    value=nb.get("agent_filename", "notebook_agent.py"),
+                    key="notebook_agent_filename",
+                )
+
+            st.caption(
+                "Agents can read and write these files using the generic "
+                "`workspace_read` / `workspace_write` tools."
+            )
+            # --- Reset Notebook files to defaults ---
+            if st.button(
+                "↺ Reset notebook files to defaults",
+                key="notebook_reset_files_btn",
+                help=(
+                    "Delete the notebook Notes/Setup/Agent files under workspace/ and "
+                    "reset the in-memory notebook state. "
+                    "Next time you open Notebook mode, the cells will be recreated "
+                    "with their default content."
+                ),
+            ):
+                reset_notebook_files(cfg)
+                st.success("Notebook files reset. Open Notebook mode to see the default cells again.")
+                _safe_rerun()
+        # --- ... ---
+        with st.expander("[Future Mode]", expanded=False):
+            st.markdown("empty")
+            # Space saved for more modes in the future
+            
 
 def sidebar_block_save_reset(cfg: AppConfig):
     """
@@ -900,7 +1343,7 @@ def sidebar_block_save_reset(cfg: AppConfig):
             ):
                 reset_chat_for_current_mode()
                 st.success("Fully reset.")
-                _safe_rerun()
+                #_safe_rerun()
 
         # Reset ONLY the active branch 
         with col_branch:
@@ -912,7 +1355,7 @@ def sidebar_block_save_reset(cfg: AppConfig):
             ):
                 reset_active_branch_for_current_mode()
                 st.success("Active branch reset.")
-                _safe_rerun()
+                #_safe_rerun()
 
 
         # --- Save current branch ---
@@ -1019,31 +1462,23 @@ def render_usage_sidebar():
 
 def sidebar_once():
     cfg: AppConfig = st.session_state.app_config
-    preset_ui = st.session_state.pop("_apply_preset_ui", None)
-    if preset_ui:
-        gp = preset_ui.get("global_params", {})
-        gm = preset_ui.get("global_model")
+    # preset_ui = st.session_state.pop("_apply_preset_ui", None)
+    # if preset_ui:
+    #     gp = preset_ui.get("global_params", {})
+    #     gm = preset_ui.get("global_model")
 
-        # ensure model is in the options list
-        cache = st.session_state.get("models_cache", []) or ["llama3:8b"]
-        if gm and gm not in cache:
-            st.session_state["models_cache"] = cache + [gm]
+    #     # ensure model is in the options list
+    #     cache = st.session_state.get("models_cache", []) or ["llama3:8b"]
+    #     if gm and gm not in cache:
+    #         st.session_state["models_cache"] = cache + [gm]
 
-        # set widget keys BEFORE creating widgets 
-        st.session_state["same_model_for_all"] = preset_ui.get(
-            "same_model_for_all",
-            st.session_state.get("same_model_for_all", cfg.same_model_for_all),
-        )
-        if gm:
-            st.session_state["global_model_select"] = gm
-
-        # global params keys
-        st.session_state["g_temp"]   = float(gp.get("temperature", 0.7))
-        st.session_state["g_topp"]   = float(gp.get("top_p", 0.9))
-        st.session_state["g_topk"]   = int(gp.get("top_k", 50))
-        st.session_state["g_maxtok"] = int(gp.get("max_tokens", 512))
-        st.session_state["g_numctx"] = int(gp.get("num_ctx", 4096))
-        st.session_state["g_seed"]   = "" if gp.get("seed", None) in ("", None, "None") else str(gp.get("seed"))
+    #     # set widget keys BEFORE creating widgets 
+    #     st.session_state["same_model_for_all"] = preset_ui.get(
+    #         "same_model_for_all",
+    #         st.session_state.get("same_model_for_all", cfg.same_model_for_all),
+    #     )
+    #     if gm:
+    #         st.session_state["global_model_select"] = gm
 
     with st.sidebar:
         # --- Mode / Settings bar (3 tabs) ---
@@ -1052,6 +1487,7 @@ def sidebar_once():
         TABS = [
             ("chat", "Chat"),
             ("consul", "Consul"),
+             ("notebook", "Notebook"),
             ("settings", "All Settings"),
         ]
 
@@ -1062,7 +1498,7 @@ def sidebar_once():
         if cur_view == "settings":
             active_tab = "settings"
         else:
-            active_tab = cur_mode if cur_mode in ("chat", "consul") else "chat"
+            active_tab = cur_mode if cur_mode in ("chat", "consul", "notebook") else "chat"
 
         cols = st.columns(len(TABS))
         for (code, label), col in zip(TABS, cols):
@@ -1083,8 +1519,8 @@ def sidebar_once():
                 else:
                     st.session_state["view"] = "playground"
                     st.session_state["mode"] = code
-                # Force a clean rerun so the bullet reflects the new state
-                _safe_rerun()
+                
+                _safe_rerun() # Force a clean rerun so the bullet reflects the new state
 
         st.title("⚙️ Settings")
 
@@ -1096,17 +1532,7 @@ def sidebar_once():
         # --- Configurable settings blocks (under the fixed header) ---
         saved_layout = getattr(cfg, "sidebar_layout", None)
         if not saved_layout:
-            layout = [
-                "MODELS",
-                "WEB",
-                "PRESETS",
-                "GLOBAL_PARAMS",
-                "AGENTS",
-                "UI",
-                "CONSUL",
-                "SAVE_RESET",
-                "USAGE",
-            ]
+            layout = DEFAULT_SIDEBAR_LAYOUT.copy() # use default layout from config
         else:
             # Only use known blocks; hidden ones are simply omitted here
             layout = [bid for bid in saved_layout if bid in SIDEBAR_BLOCK_RENDERERS]
@@ -1133,11 +1559,18 @@ def save_preset(name: str, cfg) -> bool:
         global_params=cfg.global_params.__dict__,
         agents=copy.deepcopy(cfg.agents),
         sidebar_layout=getattr(cfg, "sidebar_layout", []),
-        sidebar_expanded=getattr(cfg, "sidebar_expanded", {}) or {},
     )
+
+    data = preset_to_dict(p)
+    raw = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+
+    f = get_fernet()
+    blob = f.encrypt(raw) if f else raw
+
     path = os.path.join(PRESETS_DIR, f"{name}.json")
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(preset_to_dict(p), f, ensure_ascii=False, indent=2)
+    with open(path, "wb") as fh:
+        fh.write(blob)
+
     return True
 
 def list_presets() -> List[str]:
@@ -1148,8 +1581,22 @@ def load_preset(name: str, cfg) -> bool:
     path = os.path.join(PRESETS_DIR, f"{name}.json")
     if not os.path.exists(path):
         return False
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+
+    # Read as bytes (could be encrypted or plain JSON)
+    with open(path, "rb") as fh:
+        blob = fh.read()
+
+    f = get_fernet()
+    if f:
+        try:
+            raw = f.decrypt(blob)
+        except InvalidToken:
+            # Preset was saved before encryption was introduced; treat as plaintext JSON
+            raw = blob
+    else:
+        raw = blob
+
+    data = json.loads(raw.decode("utf-8"))
     p = preset_from_dict(data)
 
     # 1. apply global model / params
@@ -1183,12 +1630,7 @@ def load_preset(name: str, cfg) -> bool:
             if bid in ALL_SIDEBAR_BLOCKS
         }
 
-    # 7. tell the sidebar (next run) to sync widget state to these values
-    st.session_state["_apply_preset_ui"] = {
-        "global_model": cfg.global_model,
-        "global_params": cfg.global_params.clamped().__dict__,
-        "same_model_for_all": cfg.same_model_for_all,
-    }
+    # All UI widgets read from cfg on the next rerun; no extra UI sync needed
     return True
 
 
