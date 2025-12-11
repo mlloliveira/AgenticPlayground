@@ -5,10 +5,14 @@ from core.state import ensure_state, sanity_checks, sidebar_once
 from ui.styles import GLOBAL_CSS
 from views.chat import chat_page
 from views.consul import consul_page
+from views.notebook import notebook_page
+#from views.runtime import runtime_page
+from views.settings import settings_page
 
 MODE_TO_PAGE = {
     "chat": chat_page,
     "consul": consul_page,
+    "notebook": notebook_page,
 }
 
 
@@ -29,7 +33,6 @@ def main():
 
     if view == "settings":
         # Lazy import to avoid circulars
-        from views.settings import settings_page
         settings_page()
     else:
         mode = st.session_state.get("mode", "chat")
