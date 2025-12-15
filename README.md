@@ -176,6 +176,10 @@ Tools are the main way agents interact with anything beyond pure text. Only work
 - **[Streamlit code editor](https://github.com/bouzidanas/streamlit-code-editor)** – a code editor component for streamlit.io apps
 
 ---
+## Example
+![demo](./_gif/example1.gif)
+
+---
 
 ## Installation
 
