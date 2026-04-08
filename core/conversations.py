@@ -21,7 +21,7 @@ FERNET_KEY_FILE = PROJECT_APP_DIR / "conversations.key"
 
 # ---------- encryption helpers ----------
 
-def _get_fernet() -> Optional[Fernet]:
+def get_fernet() -> Optional[Fernet]:
     """
     Load or lazily create a Fernet key.
     If anything goes wrong, return None (we'll fall back to plaintext).
@@ -64,6 +64,7 @@ def _serialize_msg(m: Msg) -> Dict[str, Any]:
         "thinking": getattr(m, "thinking", None),
         "debug": getattr(m, "debug", {}) or {},
         "sources": getattr(m, "sources", []) or [],
+        "images": getattr(m, "images", []) or [],
         "id": getattr(m, "id", ""),
         "markdown": bool(getattr(m, "markdown", False)),
         "kind": getattr(m, "kind", "chat"),
@@ -106,7 +107,7 @@ def save_current_branch(name: str) -> tuple[bool, str]:
     }
 
     raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    f = _get_fernet()
+    f = get_fernet()
     blob = f.encrypt(raw) if f else raw
 
     path = _conv_path(name)
@@ -127,7 +128,7 @@ def load_conversation_payload(name: str) -> Optional[Tuple[str, Branch, Dict[str
         return None
 
     blob = path.read_bytes()
-    f = _get_fernet()
+    f = get_fernet()
     if f:
         try:
             raw = f.decrypt(blob)
