@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import streamlit as st
 
-from core.config import AppConfig
+from core.config import AppConfig, DEFAULT_SIDEBAR_LAYOUT
 from core.state import (
     ALL_SIDEBAR_BLOCKS,
     SIDEBAR_BLOCK_LABELS,
@@ -15,21 +15,17 @@ from core.state import (
 
 def _current_sidebar_layout(cfg: AppConfig) -> list[str]:
     """Return a clean layout list: only known blocks, preserve order, append missing ones at the end."""
-    layout = getattr(cfg, "sidebar_layout", None) or [
-        "MODELS",
-        "WEB",
-        "PRESETS",
-        "GLOBAL_PARAMS",
-        "AGENTS",
-        "UI",
-        "CONSUL",
-        "RESET_USAGE",
-    ]
+    # If nothing stored yet, start from the canonical default
+    layout = getattr(cfg, "sidebar_layout", None) or DEFAULT_SIDEBAR_LAYOUT.copy()
+
+    # Filter out unknown block ids just in case
     layout = [b for b in layout if b in ALL_SIDEBAR_BLOCKS]
+
     # Append any newly added blocks so they don't disappear accidentally
     for b in ALL_SIDEBAR_BLOCKS:
         if b not in layout:
             layout.append(b)
+
     return layout
 
 
@@ -54,23 +50,8 @@ def settings_page():
         "You can save your configurations by saving a new preset in the preset tab. "
     )
 
-    # ACTIVE = exactly what is stored in cfg.sidebar_layout
-    saved_layout = getattr(cfg, "sidebar_layout", None)
-    if not saved_layout:
-        # default layout if nothing saved yet
-        active = [
-            "MODELS",
-            "WEB",
-            "PRESETS",
-            "GLOBAL_PARAMS",
-            "AGENTS",
-            "UI",
-            "CONSUL",
-            "RESET_USAGE",
-        ]
-    else:
-        # filter out unknown block ids just in case
-        active = [b for b in saved_layout if b in ALL_SIDEBAR_BLOCKS]
+    # ACTIVE = current layout (with fallbacks) using the canonical defaults
+    active = _current_sidebar_layout(cfg)
 
     # HIDDEN = blocks that exist but are NOT in active
     hidden = [b for b in ALL_SIDEBAR_BLOCKS if b not in active]
